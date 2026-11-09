@@ -1,0 +1,11 @@
+# 1. Catch-all default for root files (Dockerfile, Program.cs, solution files)
+*                                           @nathanielhall-Demo/platform-team
+
+# 2. Any file under DotnetSecurityFailures/Components/ or ending in .razor -> frontend-ui
+/DotnetSecurityFailures/Components/         @nathanielhall-Demo/frontend-ui
+*.razor                                     @nathanielhall-Demo/frontend-ui
+
+# 3. Any file under Controllers/, Services/, or Data/ -> backend-api
+/DotnetSecurityFailures/Controllers/        @nathanielhall-Demo/backend-api
+/DotnetSecurityFailures/Services/           @nathanielhall-Demo/backend-api
+/DotnetSecurityFailures/Data/               @nathanielhall-Demo/backend-api
