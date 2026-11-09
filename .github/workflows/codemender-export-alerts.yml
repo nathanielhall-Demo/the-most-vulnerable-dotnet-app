@@ -334,22 +334,41 @@ jobs:
               json.dump(sarif_output, f, indent=2)
           print(f"Generated output.sarif with {len(rules)} rules and {len(results)} security results.")
 
-          # Build Markdown body for the Pinned CodeMender Backlog Issue grouped by CODEOWNERS
-          issue_lines = [
-              "## 🛡️ CodeMender Security Backlog",
-              "",
-              "> **GitOps Remediation:** Comment `/codemender fix <ID>` (for example, `/codemender fix CM-001`) on this issue to dispatch CodeMender and open a dedicated Fix PR routed to the owning team.",
-              ""
-          ]
+          # Build one Markdown file per CODEOWNER team + manifest for the GitHub CLI step
+          color_map = {
+              "backend-api": "1D76DB",
+              "frontend-ui": "5319E7",
+              "platform-team": "0E8A16"
+          }
+          manifest = []
           for owner_name, rows in by_owner.items():
-              issue_lines.append(f"### 👥 Code Owner: `{owner_name}` ({len(rows)} open)")
-              issue_lines.append("| ID | Severity | Finding | Location |")
-              issue_lines.append("| :--- | :--- | :--- | :--- |")
+              o_slug = re.sub(r"[^a-z0-9_-]+", "-", owner_name.split("/")[-1].lstrip("@").lower()).strip("-") or "unassigned"
+              body_file = f"backlog_issue_{o_slug}.md"
+              issue_lines = [
+                  f"## 🛡️ CodeMender Security Backlog — `{owner_name}`",
+                  "",
+                  f"**Repository:** `{repo_name}` | **Code Owner:** `{owner_name}` | **Open Findings:** `{len(rows)}`",
+                  "",
+                  "> **GitOps Remediation:** Comment `/codemender fix <ID>` (for example, `/codemender fix CM-001`) on this issue to dispatch CodeMender and open a dedicated Fix PR routed to your team.",
+                  "",
+                  "| ID | Severity | Finding | Location |",
+                  "| :--- | :--- | :--- | :--- |"
+              ]
               issue_lines.extend(rows)
               issue_lines.append("")
+              with open(body_file, "w") as bf:
+                  bf.write("\n".join(issue_lines))
+              manifest.append({
+                  "owner_name": owner_name,
+                  "owner_slug": o_slug,
+                  "owner_label": f"owner/{o_slug}",
+                  "color": color_map.get(o_slug, "0052CC"),
+                  "count": len(rows),
+                  "body_file": body_file
+              })
 
-          with open("backlog_issue.md", "w") as bf:
-              bf.write("\n".join(issue_lines))
+          with open("backlog_manifest.json", "w") as mf:
+              json.dump(manifest, mf, indent=2)
           '
 
       # Upload the SARIF payload directly to the target repository using the GitHub CLI
@@ -379,21 +398,67 @@ jobs:
             -F sarif=@sarif.b64 \
             -f tool_name="CodeMender"
 
-      # Create or update the Pinned CodeMender Security Backlog Issue grouped by CODEOWNERS
-      - name: Sync Pinned CodeMender Backlog Issue
+      # Create or update one CodeMender Security Backlog Issue per CODEOWNER team
+      - name: Sync Per-Team CodeMender Backlog Issues
+        shell: python
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh label create "codemender-backlog" --color "B60205" --description "CodeMender Security Backlog" --force
-          TITLE="🛡️ [CodeMender] Security Backlog"
-          EXISTING_NUM=$(gh issue list --label "codemender-backlog" --state open --json number --jq '.[0].number // empty')
+          import json
+          import subprocess
 
-          if [ -n "${EXISTING_NUM}" ]; then
-            gh issue edit "${EXISTING_NUM}" --body-file backlog_issue.md
-            echo "Updated existing Backlog Issue #${EXISTING_NUM}"
-          else
-            gh issue create --title "${TITLE}" --label "codemender-backlog" --body-file backlog_issue.md
-          fi
+          def gh(*args):
+              res = subprocess.run(["gh", *args], capture_output=True, text=True)
+              return res.stdout.strip()
+
+          # 1. Ensure base label exists
+          gh("label", "create", "codemender-backlog", "--color", "B60205", "--description", "CodeMender Security Backlog", "--force")
+
+          with open("backlog_manifest.json", "r") as f:
+              manifest = json.load(f)
+
+          active_team_labels = {item["owner_label"] for item in manifest}
+
+          # 2. Fetch all open codemender-backlog issues
+          raw_issues = gh("issue", "list", "--label", "codemender-backlog", "--state", "open", "--json", "number,title,labels")
+          open_issues = json.loads(raw_issues) if raw_issues else []
+
+          # Map owner_label -> issue number (and close any legacy combined issue without an owner/* label)
+          issue_by_team = {}
+          for iss in open_issues:
+              num = str(iss["number"])
+              labels = [lbl["name"] for lbl in iss.get("labels", [])]
+              owner_labels = [lbl for lbl in labels if lbl.startswith("owner/")]
+              if not owner_labels:
+                  gh("issue", "close", num, "--comment", "Superseded by per-team `CODEOWNERS` backlog issues.")
+                  print(f"Closed legacy combined Backlog Issue #{num}")
+              else:
+                  issue_by_team[owner_labels[0]] = num
+
+          # 3. Create or update one Backlog Issue per CODEOWNER team
+          for item in manifest:
+              owner_name = item["owner_name"]
+              owner_label = item["owner_label"]
+              color = item["color"]
+              count = item["count"]
+              body_file = item["body_file"]
+              title = f"🛡️ [CodeMender] Backlog: {owner_name} ({count} open)"
+
+              gh("label", "create", owner_label, "--color", color, "--description", f"Owned by {owner_name}", "--force")
+
+              if owner_label in issue_by_team:
+                  num = issue_by_team[owner_label]
+                  gh("issue", "edit", num, "--title", title, "--body-file", body_file)
+                  print(f"Updated Backlog Issue #{num} for {owner_name}")
+              else:
+                  out = gh("issue", "create", "--title", title, "--label", "codemender-backlog", "--label", owner_label, "--body-file", body_file)
+                  print(f"Created Backlog Issue for {owner_name}: {out}")
+
+          # 4. Auto-close any team backlog issue whose team dropped to 0 open findings
+          for owner_label, num in issue_by_team.items():
+              if owner_label not in active_team_labels:
+                  gh("issue", "close", num, "--comment", "🎉 All CodeMender security findings for this team have been resolved!")
+                  print(f"Auto-closed resolved Backlog Issue #{num} ({owner_label})")
 
       # Cleanup Sensitive Binaries (Best Practice)
       - name: Cleanup
@@ -401,7 +466,7 @@ jobs:
         run: |
           rm -f cm-linux-amd64.zip
           rm -f cm
-          rm -f output.sarif sarif.b64 backlog_issue.md codemender_report.json codemender_summary.md scan_output.log
+          rm -f output.sarif sarif.b64 backlog_issue*.md backlog_manifest.json codemender_report.json codemender_summary.md scan_output.log
           rm -rf .cm_project
           rm -rf .exploit/
           rm -f gha-creds-*.json
