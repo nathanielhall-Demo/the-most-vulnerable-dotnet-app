@@ -33,7 +33,7 @@ jobs:
       - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      # Download and Install CodeMender On-The-Fly
+      # Download and Install CodeMender On-The-Fly (Original - no new secrets needed)
       - name: Install CodeMender CLI
         run: |
           echo "Downloading CodeMender from Artifact Registry..."
@@ -174,7 +174,7 @@ jobs:
                           matched = owners
               return matched[0]
 
-          # Load JSON export
+          # Load JSON export (all findings, no Top-N cap)
           with open("codemender_report.json", "r") as f:
               findings = json.load(f)
 
