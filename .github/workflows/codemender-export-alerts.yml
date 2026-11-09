@@ -133,12 +133,44 @@ jobs:
       - name: Format SARIF Report for GitHub UI
         run: |
           python3 -c '
-          import json, re, os
+          import json, re, os, fnmatch, posixpath
 
           # GitHub input variable to extract relative path dynamically
           repo_name = "${{ github.repository }}"
           repo_short_name = repo_name.split("/")[-1]
           workspace = os.environ.get("GITHUB_WORKSPACE", "")
+
+          # Parse .github/CODEOWNERS (last matching pattern wins, matching GitHub rules)
+          codeowners_rules = []
+          for co_file in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
+              if os.path.isfile(co_file):
+                  with open(co_file, "r") as cf:
+                      for raw_line in cf:
+                          line = raw_line.split("#", 1)[0].strip()
+                          if not line:
+                              continue
+                          parts = line.split()
+                          if len(parts) >= 2:
+                              codeowners_rules.append((parts[0], parts[1:]))
+                  break
+
+          def resolve_owner(rel_path):
+              matched = ["@unassigned"]
+              norm = rel_path.lstrip("/")
+              base = posixpath.basename(norm)
+              for pattern, owners in codeowners_rules:
+                  if pattern == "*":
+                      matched = owners
+                  elif "/" not in pattern.strip("/"):
+                      if fnmatch.fnmatch(base, pattern) or norm.startswith(pattern.strip("/") + "/"):
+                          matched = owners
+                  else:
+                      clean_pat = pattern.lstrip("/")
+                      if clean_pat.endswith("/") and norm.startswith(clean_pat):
+                          matched = owners
+                      elif fnmatch.fnmatch(norm, clean_pat) or fnmatch.fnmatch(norm, clean_pat.rstrip("/") + "/*"):
+                          matched = owners
+              return matched[0]
 
           # Load JSON export
           with open("codemender_report.json", "r") as f:
@@ -186,14 +218,6 @@ jobs:
               if finding_status in ("FIXED", "DISMISSED", "CLOSED"):
                   continue
 
-              # Create a stable, clean rule ID (include severity so rules with same title do not collide on score)
-              slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", title).strip("-")[:80]
-              rule_id = f"CM-{raw_severity}-{slug}" if slug else f"CM-{raw_severity}-Finding"
-
-              level = severity_to_level.get(raw_severity, "warning")
-              ghas_score = severity_to_ghas_score.get(raw_severity, "5.5")
-              precision = severity_to_precision.get(raw_severity, "medium")
-
               # Normalize file_path to clean repository-relative path
               file_path = finding.get("file_path", "unknown")
               relative_path = file_path
@@ -205,12 +229,25 @@ jobs:
                   relative_path = relative_path[len(repo_short_name + "/"):]
               relative_path = relative_path.lstrip("./").lstrip("/") or "unknown"
 
-              # Extract any CWE references from title or analysis to enrich GitHub SAST category tables
-              tags = ["security", "codemender", f"severity/{raw_severity.lower()}"]
+              # Resolve owning team from .github/CODEOWNERS
+              code_owner = resolve_owner(relative_path)
+              owner_slug = re.sub(r"[^a-z0-9_-]+", "-", code_owner.split("/")[-1].lstrip("@").lower()).strip("-") or "unassigned"
+
+              # Create a stable, clean rule ID (include severity and owner so owner tags stay distinct per team)
+              slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", title).strip("-")[:65]
+              base_id = f"CM-{raw_severity}-{slug}" if slug else f"CM-{raw_severity}-Finding"
+              rule_id = f"{base_id}--{owner_slug}"
+
+              level = severity_to_level.get(raw_severity, "warning")
+              ghas_score = severity_to_ghas_score.get(raw_severity, "5.5")
+              precision = severity_to_precision.get(raw_severity, "medium")
+
+              # Extract any CWE references and include the owner/<team> tag (capped at 10 tags for GitHub SARIF limit)
+              tags = ["security", "codemender", f"severity/{raw_severity.lower()}", f"owner/{owner_slug}"]
               cwe_matches = re.findall(r"CWE-\d+", f"{title} {analysis}", re.IGNORECASE)
               for cwe in cwe_matches:
                   cwe_tag = f"external/cwe/{cwe.lower()}"
-                  if cwe_tag not in tags:
+                  if cwe_tag not in tags and len(tags) < 10:
                       tags.append(cwe_tag)
 
               # Populate Rules Array with GitHub Code Scanning required security properties
@@ -228,8 +265,8 @@ jobs:
                           "level": level
                       },
                       "help": {
-                          "text": f"{title}\n\n{analysis}",
-                          "markdown": f"### {title}\n\n**Severity:** `{raw_severity}`\n\n{analysis}"
+                          "text": f"Code Owner: {code_owner}\n\n{title}\n\n{analysis}",
+                          "markdown": f"### {title}\n\n**Severity:** `{raw_severity}` | **Code Owner:** `{code_owner}`\n\n{analysis}"
                       },
                       "properties": {
                           "tags": tags,
@@ -248,7 +285,7 @@ jobs:
                   "ruleId": rule_id,
                   "level": level,
                   "message": {
-                      "text": f"[{raw_severity}] {title}: {analysis}"
+                      "text": f"[{raw_severity}] ({code_owner}) {title}: {analysis}"
                   },
                   "locations": [
                       {
